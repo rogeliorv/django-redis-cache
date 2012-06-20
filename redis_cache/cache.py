@@ -14,9 +14,16 @@ try:
 except ImportError:
     raise InvalidCacheBackendError(
         "Redis cache backend requires the 'redis-py' library")
+    
+try:
+    from redish.client import Client as RedisClient
+except ImportError:
+    raise ImportError("django-redis-cache uses redish library")
+
 from redis.connection import UnixDomainSocketConnection, Connection
 from redis.connection import DefaultParser
 
+import hashlib
 
 class CacheKey(object):
     """
@@ -103,7 +110,7 @@ class CacheClass(BaseCache):
             parser_class=self.parser_class,
             **kwargs
         )
-        self._client = redis.Redis(
+        self._client = RedisClient(
             connection_pool=connection_pool,
             **kwargs
         )
@@ -168,7 +175,7 @@ class CacheClass(BaseCache):
         Returns ``True`` if the object was added, ``False`` if not.
         """
         key = self.make_key(key, version=version)
-        if self._client.exists(key):
+        if self._client.api.exists(key):
             return False
         return self.set(key, value, timeout)
 
@@ -179,7 +186,7 @@ class CacheClass(BaseCache):
         Returns unpickled value if key is found, the default if not.
         """
         key = self.make_key(key, version=version)
-        value = self._client.get(key)
+        value = self._client.api.get(key)
         if value is None:
             return default
         try:
@@ -221,7 +228,7 @@ class CacheClass(BaseCache):
         """
         Remove a key from the cache.
         """
-        self._client.delete(self.make_key(key, version=version))
+        self._client.api.delete(self.make_key(key, version=version))
 
     def delete_many(self, keys, version=None):
         """
@@ -229,14 +236,14 @@ class CacheClass(BaseCache):
         """
         if keys:
             keys = map(lambda key: self.make_key(key, version=version), keys)
-            self._client.delete(*keys)
+            self._client.api.delete(*keys)
 
     def clear(self):
         """
         Flush all cache keys.
         """
         # TODO : potential data loss here, should we only delete keys based on the correct version ?
-        self._client.flushdb()
+        self._client.api.flushdb()
 
     def unpickle(self, value):
         """
@@ -254,7 +261,7 @@ class CacheClass(BaseCache):
         recovered_data = SortedDict()
         new_keys = map(lambda key: self.make_key(key, version=version), keys)
         map_keys = dict(zip(new_keys, keys))
-        results = self._client.mget(new_keys)
+        results = self._client.api.mget(new_keys)
         for key, value in zip(new_keys, results):
             if value is None:
                 continue
@@ -275,7 +282,7 @@ class CacheClass(BaseCache):
         If timeout is given, that timeout will be used for the key; otherwise
         the default cache timeout will be used.
         """
-        pipeline = self._client.pipeline()
+        pipeline = self._client.api.pipeline()
         for key, value in data.iteritems():
             self.set(key, value, timeout, version=version, client=pipeline)
         pipeline.execute()
@@ -286,16 +293,60 @@ class CacheClass(BaseCache):
         ValueError exception.
         """
         key = self.make_key(key, version=version)
-        exists = self._client.exists(key)
+        exists = self._client.api.exists(key)
         if not exists:
             raise ValueError("Key '%s' not found" % key)
         try:
-            value = self._client.incr(key, delta)
+            value = self._client.api.incr(key, delta)
         except redis.ResponseError:
             value = self.get(key) + 1
             self.set(key, value)
         return value
-
+    
+    # TODO: Change memoization to use serializer instead of pickle directly
+    def memoize(self, timeout=0, key_generator = None, use_prefix = True):
+        '''Memoizes function results. Makes redis act as a cache.
+        The purpose of this function is avoid re-executing certain tasks.
+        Every time the decorated function is executed we check the cache, if there is
+        anything in the cache under that key, we return the value in the cache
+        
+        @key_generator A function that generates the key in which the result will be stored
+        @timeout The expiration for the saved value. The result can expire after some
+        time, a subsequent call will result in recomputation. (Good for API calls).
+        If the given timeout is equal or less than zero, the value never expires.
+        '''
+                
+        key_generator = key_generator or self.simple_key_generator
+        redis_instance = self
+        
+        def wrapper(func):
+            def wrapped(*args, **kwargs):                
+                key = key_generator(func, args, kwargs)
+                if use_prefix: key = redis_instance.MEMOIZE_PREFIX + key 
+                result = redis_instance.api.get(key)
+                if result:
+                    return pickle.loads(result)
+                else:
+                    result = func(*args, **kwargs)
+                    redis_instance.api.set(key, pickle.dumps(result))                    
+                    if timeout > 0:
+                        redis_instance.api.expire(key, timeout)
+                    return result
+            return wrapped
+        return wrapper
+        
+        
+    def simple_key_generator(self, func, *args, **kwargs):
+        '''Returns base_string(args=args, kwargs=kwargs) as the key. Useful for
+        identifying your calls as keys in the cache.'''            
+        return '%s(args=%s, kwargs=%s)' % (func.func_name, unicode(args), unicode(kwargs))
+    
+    def sha_key_generator(self, func, *args, **kwargs):
+        '''Gives the function name and the arguments to the sha512 algorithms and
+        returns the hexdigest'''
+        sha = hashlib.sha512()
+        sha.update(func.func_name + unicode(args) + unicode(kwargs))
+        return sha.hexdigest()
 
 class RedisCache(CacheClass):
     """
@@ -319,7 +370,7 @@ class RedisCache(CacheClass):
             version = self.version
         old_key = self.make_key(key, version)
         value = self.get(old_key, version=version)
-        ttl = self._client.ttl(old_key)
+        ttl = self._client.api.ttl(old_key)
         if value is None:
             raise ValueError("Key '%s' not found" % key)
         new_key = self.make_key(key, version=version+delta)
