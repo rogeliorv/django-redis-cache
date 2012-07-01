@@ -339,13 +339,13 @@ class CacheClass(BaseCache):
     def simple_key_generator(self, func, *args, **kwargs):
         '''Returns base_string(args=args, kwargs=kwargs) as the key. Useful for
         identifying your calls as keys in the cache.'''            
-        return '%s(args=%s, kwargs=%s)' % (func.func_name, unicode(args), unicode(kwargs))
+        return '%s(args=%s, kwargs=%s)' % (func.func_name, smart_unicode(args), smart_unicode(kwargs))
     
     def sha_key_generator(self, func, *args, **kwargs):
         '''Gives the function name and the arguments to the sha512 algorithms and
         returns the hexdigest'''
         sha = hashlib.sha512()
-        sha.update(func.func_name + unicode(args) + unicode(kwargs))
+        sha.update(func.func_name + smart_unicode(args) + smart_unicode(kwargs))
         return sha.hexdigest()
 
 class RedisCache(CacheClass):
